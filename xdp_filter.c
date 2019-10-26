@@ -6,6 +6,8 @@
 #include <uapi/linux/if_ether.h>
 #include <uapi/linux/ip.h>
 
+#include <linux/hash.h>
+
 
 /**
  * Copied from <uapi/linux/tcp.h>,
@@ -86,6 +88,7 @@ struct tcphdr {
 #define memmove(dest, src, n)  __builtin_memmove((dest), (src), (n))
 #endif
 
+
 /**
  * Packet processing context.
  */
@@ -98,6 +101,58 @@ struct Packet {
     struct iphdr* ip;
     struct tcphdr* tcp;
 };
+
+
+/**
+ * Cookie computation
+ */
+
+struct FourTuple {
+    u32 saddr;
+    u32 daddr;
+    u16 sport;
+    u16 dport;
+};
+
+INTERNAL u32
+cookie_counter() {
+    return bpf_ktime_get_ns() >> (10 + 10 + 10 + 3); /* 8.6 sec */
+}
+
+INTERNAL u32
+hash_crc32(u32 data, u32 seed) {
+    return hash_32(seed | data, 32); /* TODO: use better hash */
+}
+
+INTERNAL u32
+cookie_hash_count(u32 seed, u32 count) {
+    return hash_crc32(count, seed);
+}
+
+INTERNAL u32
+cookie_hash_base(struct FourTuple t, u32 seqnum) {
+    /* TODO: randomize periodically from external source */
+    u32 cookie_seed = 42;
+
+    u32 res = hash_crc32(((u64)t.daddr << 32) | t.saddr, cookie_seed);
+    return hash_crc32(((u64)t.dport << 48) | ((u64)seqnum << 16) | (u64)t.sport, res);
+}
+
+INTERNAL u32
+cookie_make(struct FourTuple tuple, u32 seqnum, u32 count) {
+    return seqnum + cookie_hash_count(cookie_hash_base(tuple, seqnum), count);
+}
+
+INTERNAL int
+cookie_check(struct FourTuple tuple, u32 seqnum, u32 cookie, u32 count) {
+    u32 hb = cookie_hash_base(tuple, seqnum);
+    cookie -= seqnum;
+    if (cookie == cookie_hash_count(hb, count)) {
+        return 1;
+    }
+    return cookie == cookie_hash_count(hb, count - 1);
+}
+
 
 /**
  * Calculate sum of 16-bit words from `data` of `size` bytes,
@@ -170,7 +225,8 @@ process_tcp_syn(struct Packet* packet) {
     }
 
     /* Create SYN-ACK with cookie */
-    const u32 cookie = 42;
+    struct FourTuple tuple = {ip->saddr, ip->daddr, tcp->source, tcp->dest};
+    const u32 cookie = cookie_make(tuple, bpf_ntohl(tcp->seq), cookie_counter());
     tcp->ack_seq = bpf_htonl(bpf_ntohl(tcp->seq) + 1);
     tcp->seq = bpf_htonl(cookie);
     tcp->ack = 1;
@@ -213,6 +269,22 @@ process_tcp_syn(struct Packet* packet) {
 
 INTERNAL int
 process_tcp_ack(struct Packet* packet) {
+    struct iphdr*  ip    = packet->ip;
+    struct tcphdr* tcp   = packet->tcp;
+
+    const struct FourTuple tuple = {
+            ip->saddr, ip->daddr, tcp->source, tcp->dest};
+    if (cookie_check(
+            tuple,
+            bpf_ntohl(tcp->seq) - 1,
+            bpf_ntohl(tcp->ack_seq) - 1,
+            cookie_counter())) {
+        /* TODO: remember legitimate client */
+        LOG("      cookie matches for client %x", ip->saddr);
+    } else {
+        LOG("      cookie mismatch");
+        return XDP_DROP;
+    }
     return XDP_PASS;
 }
 
