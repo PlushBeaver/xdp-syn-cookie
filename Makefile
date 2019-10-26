@@ -24,7 +24,7 @@ xdp_%.o: xdp_%.c Makefile
 
 .PHONY: all clean
 
-all: xdp_filter.o
+all: xdp_filter.o xdp_dummy.o
 
 clean:
 	rm -f ./*.o

@@ -7,6 +7,7 @@ action="$1"
 netns=xdp-test
 local=xdp-local
 remote=xdp-remote
+dummy=xdp_dummy.o
 filter=xdp_filter.o
 
 case "$action" in
@@ -34,10 +35,12 @@ status)
     ;;
 
 attach)
+    ip netns exec ${netns} ip -force link set dev ${remote} xdp object ${dummy} >/dev/null
     ip -force link set dev ${local} xdp object ${filter} verbose
     ;;
 
 detach)
+    ip netns exec ${netns} ip link set dev ${remote} xdp off
     ip link set dev ${local} xdp off
     ;;
 
