@@ -16,6 +16,8 @@ CFLAGS = \
 	-I$(KDIR)/arch/$(ARCH)/include/generated/uapi \
 	-D__KERNEL__ \
 	\
+	-Wno-int-to-void-pointer-cast \
+	\
 	-fno-stack-protector -O2 -g
 
 xdp_%.o: xdp_%.c Makefile
