@@ -73,6 +73,19 @@ struct tcphdr {
 #define LOG(fmt, ...)
 #endif
 
+/* eBPF lacks these functions, but LLVM provides builtins */
+#ifndef memset
+#define memset(dest, chr, n)   __builtin_memset((dest), (chr), (n))
+#endif
+
+#ifndef memcpy
+#define memcpy(dest, src, n)   __builtin_memcpy((dest), (src), (n))
+#endif
+
+#ifndef memmove
+#define memmove(dest, src, n)  __builtin_memmove((dest), (src), (n))
+#endif
+
 /**
  * Packet processing context.
  */
@@ -86,9 +99,116 @@ struct Packet {
     struct tcphdr* tcp;
 };
 
+/**
+ * Calculate sum of 16-bit words from `data` of `size` bytes,
+ * Size is assumed to be even, from 0 to MAX_CSUM_BYTES.
+ */
+#define MAX_CSUM_WORDS 32
+#define MAX_CSUM_BYTES (MAX_CSUM_WORDS * 2)
+
+INTERNAL u32
+sum16(const void* data, u32 size, const void* data_end) {
+    u32 s = 0;
+#pragma unroll
+    for (u32 i = 0; i < MAX_CSUM_WORDS; i++) {
+        if (2*i >= size) {
+            return s; /* normal exit */
+        }
+        if (data + 2*i + 1 + 1 > data_end) {
+            return 0; /* should be unreachable */
+        }
+        s += ((const u16*)data)[i];
+    }
+    return s;
+}
+
+/**
+ * A handy version of `sum16()` for 32-bit words.
+ * Does not actually conserve any instructions.
+ */
+INTERNAL u32
+sum16_32(u32 v) {
+    return (v >> 16) + (v & 0xffff);
+}
+
+/**
+ * Carry upper bits and compute one's complement for a checksum.
+ */
+INTERNAL u16
+carry(u32 csum) {
+    csum = (csum & 0xffff) + (csum >> 16);
+    csum = (csum & 0xffff) + (csum >> 16); // loop
+    return ~csum;
+}
+
 INTERNAL int
 process_tcp_syn(struct Packet* packet) {
-    return XDP_PASS;
+    struct xdp_md* ctx   = packet->ctx;
+    struct ethhdr* ether = packet->ether;
+    struct iphdr*  ip    = packet->ip;
+    struct tcphdr* tcp   = packet->tcp;
+
+    /* Required to verify checksum calculation */
+    const void* data_end = (void*)ctx->data_end;
+
+    /* Validate IP header length */
+    const u32 ip_len = ip->ihl * 4;
+    if ((void*)ip + ip_len > data_end) {
+        return XDP_DROP; /* malformed packet */
+    }
+    if (ip_len > MAX_CSUM_BYTES) {
+        return XDP_ABORTED; /* implementation limitation */
+    }
+
+    /* Validate TCP length */
+    const u32 tcp_len = tcp->doff * 4;
+    if ((void*)tcp + tcp_len > data_end) {
+        return XDP_DROP; /* malformed packet */
+    }
+    if (tcp_len > MAX_CSUM_BYTES) {
+        return XDP_ABORTED; /* implementation limitation */
+    }
+
+    /* Create SYN-ACK with cookie */
+    const u32 cookie = 42;
+    tcp->ack_seq = bpf_htonl(bpf_ntohl(tcp->seq) + 1);
+    tcp->seq = bpf_htonl(cookie);
+    tcp->ack = 1;
+
+    /* Reverse TCP ports */
+    const u16 temp_port = tcp->source;
+    tcp->source = tcp->dest;
+    tcp->dest = temp_port;
+
+    /* Reverse IP direction */
+    const u32 temp_ip = ip->saddr;
+    ip->saddr = ip->daddr;
+    ip->daddr = temp_ip;
+
+    /* Reverse Ethernet direction */
+    struct ethhdr temp_ether = *ether;
+    memcpy(ether->h_dest, temp_ether.h_source, ETH_ALEN);
+    memcpy(ether->h_source, temp_ether.h_dest, ETH_ALEN);
+
+    /* Clear IP options */
+    memset(ip + 1, ip_len - sizeof(struct iphdr), 0);
+
+    /* Update IP checksum */
+    ip->check = 0;
+    ip->check = carry(sum16(ip, ip_len, data_end));
+
+    /* Update TCP checksum */
+    u32 tcp_csum = 0;
+    tcp_csum += sum16_32(ip->saddr);
+    tcp_csum += sum16_32(ip->daddr);
+    tcp_csum += 0x0600;
+    tcp_csum += tcp_len << 8;
+    tcp->check = 0;
+    tcp_csum += sum16(tcp, tcp_len, data_end);
+    tcp->check = carry(tcp_csum);
+
+    /* Send packet back */
+    return XDP_TX;
 }
 
 INTERNAL int
