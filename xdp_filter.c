@@ -93,7 +93,7 @@ struct tcphdr {
  * Packet processing context.
  */
 struct Packet {
-    /* For verification to for passing to BPF helpers. */
+    /* For passing to BPF helpers in order to verify offsets. */
     struct xdp_md* ctx;
 
     /* Layer headers (may be NULL on lower stages) */
@@ -102,6 +102,37 @@ struct Packet {
     struct tcphdr* tcp;
 };
 
+/**
+ * Upon providing a valid SYN-cookie, the client is allowed to connect
+ * a number of times before repeated verification. The number of times
+ * this validated client sent a SYN ("checks") is associated with
+ * the client's IP and is increased for each SYN received.
+ */
+enum {
+    CHECKS_MIN = 1,
+    CHECKS_MAX = 1000,
+    CHECKS_DEF = 100
+};
+
+enum {
+    TABLE_SIZE = 1 << 24
+};
+
+/**
+ * Validated clients table.
+ */
+struct bpf_map_def SEC("maps") clients = {
+    .type        = BPF_MAP_TYPE_HASH,
+    .key_size    = sizeof(u32),  /* IP address */
+    .value_size  = sizeof(u32),  /* SYN's since last check */
+    .max_entries = TABLE_SIZE,
+};
+
+/* TODO: this should be a tunable parameter (via another BPF map). */
+INTERNAL u32
+get_checks_allowed() {
+    return CHECKS_DEF;
+}
 
 /**
  * Cookie computation
@@ -203,6 +234,21 @@ process_tcp_syn(struct Packet* packet) {
     struct iphdr*  ip    = packet->ip;
     struct tcphdr* tcp   = packet->tcp;
 
+    /* Try using checks limit */
+    u32* checks = (u32*)bpf_map_lookup_elem(&clients, &ip->saddr);
+    if (checks) {
+        const u32 checks_allowed = get_checks_allowed();
+        if (*checks <= checks_allowed) {
+            __sync_fetch_and_add(checks, 1);
+            const u32 checks_used = *checks;
+            if (checks_used <= checks_allowed) {
+                const u32 checks_left = checks_allowed - checks_used;
+                LOG("      client is valid (%u checks left)", checks_left);
+                return XDP_PASS;
+            }
+        }
+    }
+
     /* Required to verify checksum calculation */
     const void* data_end = (void*)ctx->data_end;
 
@@ -279,8 +325,9 @@ process_tcp_ack(struct Packet* packet) {
             bpf_ntohl(tcp->seq) - 1,
             bpf_ntohl(tcp->ack_seq) - 1,
             cookie_counter())) {
-        /* TODO: remember legitimate client */
         LOG("      cookie matches for client %x", ip->saddr);
+        u32 checks = 0;
+        bpf_map_update_elem(&clients, &ip->saddr, &checks, BPF_ANY);
     } else {
         LOG("      cookie mismatch");
         return XDP_DROP;
@@ -290,20 +337,38 @@ process_tcp_ack(struct Packet* packet) {
 
 INTERNAL int
 process_tcp(struct Packet* packet) {
-    struct tcphdr* tcp   = packet->tcp;
+    struct iphdr*  ip  = packet->ip;
+    struct tcphdr* tcp = packet->tcp;
 
     LOG("    TCP(sport=%d dport=%d flags=0x%x)",
             bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest),
             bpf_ntohs(tcp->flags) & 0xff);
 
-    switch (bpf_ntohs(tcp->flags) & (TH_SYN | TH_ACK)) {
-    case TH_SYN:
+    /* Only consider SYN and ACK flags (e.g. PUSH is ignored) */
+    const u16 flags = bpf_ntohs(tcp->flags) & (TH_SYN | TH_ACK);
+
+    /* Issue a SYN cookie or track validated client checks count */
+    if (flags == TH_SYN) {
         return process_tcp_syn(packet);
-    case TH_ACK:
-        return process_tcp_ack(packet);
-    default:
-        return XDP_PASS;
     }
+
+    /* Check if client is validated */
+    const u32* checks = (u32*)bpf_map_lookup_elem(&clients, &ip->saddr);
+    if (checks) {
+        const u32 checks_allowed = get_checks_allowed();
+        const u32 checks_left = *checks;
+        if (checks_left <= checks_allowed) {
+            LOG("      client is valid (%u checks left)", checks_left);
+            return XDP_PASS;
+        }
+    }
+
+    /* Client is not validated, check ACK for SYN-cookie */
+    if (flags == TH_ACK) {
+        return process_tcp_ack(packet);
+    }
+
+    return XDP_DROP;
 }
 
 INTERNAL int
@@ -316,8 +381,6 @@ process_ip(struct Packet* packet) {
     if (ip->protocol != IPPROTO_TCP) {
         return XDP_PASS;
     }
-
-    /* TODO: check if client has passed SYN cookie challenge */
 
     struct tcphdr* tcp = (struct tcphdr*)(ip + 1);
     if ((void*)(tcp + 1) > (void*)packet->ctx->data_end) {
