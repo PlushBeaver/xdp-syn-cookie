@@ -24,9 +24,12 @@ xdp_%.o: xdp_%.c Makefile
 	$(CLANG) -c -emit-llvm $(CFLAGS) $< -o - | \
 	$(LLC) -march=bpf -filetype=obj -o $@
 
+xdp_control: xdp_control.cc
+	g++ -std=c++17 -lbpf -lelf $< -o $@
+
 .PHONY: all clean
 
-all: xdp_filter.o xdp_dummy.o
+all: xdp_filter.o xdp_dummy.o xdp_control
 
 clean:
 	rm -f ./*.o
