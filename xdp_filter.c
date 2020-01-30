@@ -103,6 +103,30 @@ struct Packet {
 };
 
 /**
+ * Counters
+ */
+
+enum Counter {
+    COUNTER_INPUT,
+    COUNTER_PASS,
+    COUNTER_BACK,
+    COUNTER_DROP,
+    COUNTER_NUM
+};
+
+struct Traffic {
+    u64 packets;
+    u64 bytes;
+};
+
+struct bpf_map_def SEC("maps") counters = {
+    .type        = BPF_MAP_TYPE_PERCPU_ARRAY,
+    .key_size    = sizeof(u32),
+    .value_size  = sizeof(struct Traffic),
+    .max_entries = COUNTER_NUM,
+};
+
+/**
  * Upon providing a valid SYN-cookie, the client is allowed to connect
  * a number of times before repeated verification. The number of times
  * this validated client sent a SYN ("checks") is associated with
@@ -420,7 +444,30 @@ int xdp_main(struct xdp_md* ctx) {
     }
 
     packet.ether = ether;
-    return process_ether(&packet);
+    const int action = process_ether(&packet);
+
+    /* Update packet counters */
+    u32 counter_id = COUNTER_PASS;
+    switch (action) {
+    case XDP_TX:
+        counter_id = COUNTER_BACK;
+        break;
+    case XDP_DROP:
+        counter_id = COUNTER_DROP;
+        break;
+    case XDP_PASS:
+    default:
+        counter_id = COUNTER_PASS;
+        break;
+    }
+
+    struct Traffic* traffic = bpf_map_lookup_elem(&counters, &counter_id);
+    if (traffic) {
+        traffic->packets++;
+        traffic->bytes += ctx->data_end - ctx->data;
+    }
+
+    return action;
 }
 
 char _license[] SEC("license") = "GPL";
