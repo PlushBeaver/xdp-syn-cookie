@@ -25,7 +25,7 @@ xdp_%.o: xdp_%.c Makefile
 	$(LLC) -march=bpf -filetype=obj -o $@
 
 xdp_control: xdp_control.cc
-	g++ -std=c++17 -lbpf -lelf $< -o $@
+	g++ -std=c++17 $< -o $@ -lbpf -lelf 
 
 .PHONY: all clean
 
